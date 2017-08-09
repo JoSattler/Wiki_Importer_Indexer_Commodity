@@ -12,7 +12,8 @@ import com.mongodb.spark.MongoSpark
 import org.apache.commons.cli._
 import org.apache.spark.api.java.JavaRDD.toRDD
 import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
-
+import java.util.Calendar
+import org.apache.spark.sql.functions._
 
 /*Created by Jörn Sattler for Projekt: "Wikiplag"
  *
@@ -71,7 +72,7 @@ object SparkApp {
     options.addOption(OptionBuilder.create("dn"))
 
     OptionBuilder.withLongOpt("db_type")
-    OptionBuilder.withDescription("Database Type")
+    OptionBuilder.withDescription("Database Type: MySQL = mysql, MongoDB = mong, Cassandra = cass")
     OptionBuilder.isRequired
     OptionBuilder.hasArgs(1)
     OptionBuilder.withType(classOf[String])
@@ -93,6 +94,10 @@ object SparkApp {
     OptionBuilder.withType(classOf[String])
     OptionBuilder.withArgName("tablei")
     options.addOption(OptionBuilder.create("it"))
+
+    OptionBuilder.withLongOpt("help")
+    OptionBuilder.hasArg(false)
+    options.addOption(OptionBuilder.create("h"))
 
     /* Commands */
 
@@ -120,6 +125,10 @@ object SparkApp {
     options
   }
 
+  private def printHelp(options: Options) = {
+    new HelpFormatter().printHelp(115, "wiki_importer_indexer.jar", "\nOptions are:", options, "\n BA Jörn Sattler", true)
+  }
+
   def main(args: Array[String]) {
     val options = createCLiOptions()
 
@@ -133,7 +142,11 @@ object SparkApp {
       val dbType = commandLine.getParsedOptionValue("db_type").asInstanceOf[String]
       val dbWTab = commandLine.getParsedOptionValue("db_wtable").asInstanceOf[String]
       val dbITab = commandLine.getParsedOptionValue("db_itable").asInstanceOf[String]
-      println(dbType)
+
+      if (commandLine.hasOption("h")) {
+        printHelp(options)
+        return
+      }
       if (commandLine.hasOption("e")) {
         val file = commandLine.getParsedOptionValue("e").asInstanceOf[String]
         if (dbType == "cass") {
@@ -169,8 +182,10 @@ object SparkApp {
     } catch {
       case e: ParseException =>
         println("Unexpected ParseException: " + e.getMessage)
+        printHelp(options)
       case e: Exception =>
         e.printStackTrace()
+        printHelp(options)
     }
 
   }
@@ -179,7 +194,7 @@ object SparkApp {
    * Method that parses the wikidump and writes the articles in a cassandra dataspace.
    * Method for parsing the given Wikipedia-XML-Dump and wiritng its contents in a Cassandra Database. 
    * 
-   * @param hadoopFile Filepath to the Wikipedia-XML Dump
+   * @param wikidump Filepath to the Wikipedia-XML Dump
    * @param cassandraPort Portnumber required to access Cassandra
    * @param cassandraDatabase IP required to access Cassandra
    * @param cassandraUser Cassandra Database User
@@ -197,9 +212,10 @@ object SparkApp {
    * 
    *
    */
-  private def extractTextCassandra(hadoopFile: String, cassandraHost: String, cassandraPort: Int, cassandraUser: String, cassandraPW: String, cassandraKeyspace: String, cassandraTables: String) {
+  private def extractTextCassandra(wikidump: String, cassandraHost: String, cassandraPort: Int, cassandraUser: String, cassandraPW: String, cassandraKeyspace: String, cassandraTables: String) {
     println("Import Wiki-Articles Cassandra")
     println("Starting Import")
+    val t0 = System.nanoTime()
     val sparkConf = new SparkConf(true).setAppName("WikiImporter_Cassandra")
       .set("spark.cassandra.connection.host", cassandraHost)
       .set("spark.cassandra.connection.port", cassandraPort.toString())
@@ -211,13 +227,15 @@ object SparkApp {
     val df = sqlContext.read
       .format("com.databricks.spark.xml")
       .option("rowTag", "page")
-      .load(hadoopFile)
+      .load(wikidump)
 
     df.filter("ns = 0")
       .select("id", "title", "revision.text")
       .rdd.map(X => (X.getLong(0), X.getString(1), WikiDumpParser.parseXMLWikiPage(X.getStruct(2).getString(0))))
       .saveToCassandra(cassandraKeyspace, cassandraTables, SomeColumns("docid", "title", "wikitext"))
     println("Import Complete")
+    val t1 = System.nanoTime()
+    println((t1 - t0) / 1e9d)
     sc.stop()
   }
 
@@ -225,7 +243,7 @@ object SparkApp {
    * Method that parses the wikidump and writes the articles in a MySQL dataspace.
    * Method for parsing the given Wikipedia-XML-Dump and wiritng its contents in a MySQL Database. 
    * 
-   * @param hadoopFile Filepath to the Wikipedia-XML Dump
+   * @param wikidump Filepath to the Wikipedia-XML Dump
    * @param mySQLDBPath IP required to access the MySQL Database
    * @param mySQLDBPort Portnumber required to access the MySQL Database
    * @param mySQLDBUser MySQL Database User
@@ -246,23 +264,25 @@ object SparkApp {
    * always seem to map Strings regardless of length to TEXT this could be a good thing to improve performance (e.g. use VARCHAR(x). 
    * 2. Spark will create a table without PRIMARY KEYs or INDEXes (if no table is created beforehand)
    */
-  private def extractTextMySQL(hadoopFile: String, mySQLDBHost: String, mySQLDBPort: Int, mySQLDBUser: String, mySQLDBPW: String, mySQLDBDatabase: String, mySQLTables: String) {
+  private def extractTextMySQL(wikidump: String, mySQLDBHost: String, mySQLDBPort: Int, mySQLDBUser: String, mySQLDBPW: String, mySQLDBDatabase: String, mySQLTables: String) {
     println("Import Wiki-Articles MySQL")
     println("Starting Import")
+
     val mySQLClient = s"jdbc:mysql://${mySQLDBHost}:${mySQLDBPort}/${mySQLDBDatabase}"
     val sparkConf = new SparkConf(true).setAppName("WikiImporter_MySQL")
     val sc = new SparkContext(sparkConf)
     val sqlContext = new SQLContext(sc)
+    //Load Wikipedia XML Dump
     val df = sqlContext.read
       .format("com.databricks.spark.xml")
       .option("rowTag", "page")
-      .load(hadoopFile)
-
+      .load(wikidump)
+    println("parsingfile complete")
     val prop = new java.util.Properties
     prop.setProperty("driver", "com.mysql.jdbc.Driver")
     prop.setProperty("user", mySQLDBUser)
     prop.setProperty("password", mySQLDBPW)
-
+    //Parse Dump for docID, title, articletex
     val wikirdd = df
       .filter("ns = 0")
       .select("id", "title", "revision.text")
@@ -277,7 +297,7 @@ object SparkApp {
    * Method that parses the wikidump and writes the articles in a MongoDB.
    * Method for parsing the given Wikipedia-XML-Dump and writing its contents in a MongoDB. 
    * 
-   * @param hadoopFile Filepath to the Wikipedia-XML Dump
+   * @param wikidump Filepath to the Wikipedia-XML Dump
    * @param mongoDBPath IP required to access the MySQL Database
    * @param mongoDBPort Portnumber required to access the MongoDB
    * @param mongoDBUser MongoDB Database User
@@ -299,9 +319,10 @@ object SparkApp {
    * 3. In this case since we use the Wikipedia-DocumentID (docID) as "_id" field in MongoDB it will have an INDEX 
    */
 
-  private def extractTextMongo(hadoopFile: String, mongoDBHost: String, mongoDBPort: Int, mongoDBUser: String, mongoDBPW: String, mongoDBDatabase: String, mongoDBCollection: String) {
+  private def extractTextMongo(wikidump: String, mongoDBHost: String, mongoDBPort: Int, mongoDBUser: String, mongoDBPW: String, mongoDBDatabase: String, mongoDBCollection: String) {
     println("Import Wiki-Articles MongoDB")
     println("Starting Import")
+    val t0 = System.nanoTime()
     val mongoClient = s"mongodb://${mongoDBUser}:${mongoDBPW}@${mongoDBHost}:${mongoDBPort}/${mongoDBDatabase}"
     val sc = SparkSession.builder().appName("WikiImporter_MongoDB")
       .config("spark.mongodb.input.uri", s"${mongoClient}.${mongoDBCollection}")
@@ -312,7 +333,7 @@ object SparkApp {
     val df = sqlContext.read
       .format("com.databricks.spark.xml")
       .option("rowTag", "page")
-      .load(hadoopFile)
+      .load(wikidump)
       .filter("ns = 0")
       .select("id", "title", "revision.text")
 
@@ -320,7 +341,10 @@ object SparkApp {
       df.rdd.map(X => (X.getLong(0), X.getString(1), WikiDumpParser.parseXMLWikiPage(X.getStruct(2).getString(0))))
     MongoSpark.save(sqlContext.createDataFrame(wikirdd).toDF("_id", "title", "wikitext").write.mode("append"))
     println("Import Complete")
+    val t1 = System.nanoTime()
+    println((t1 - t0) / 1e9d)
     sc.stop()
+
   }
 
   /*
@@ -346,13 +370,26 @@ object SparkApp {
       .set("spark.cassandra.auth.username", cassandraUser)
       .set("spark.cassandra.auth.password", cassandraPW)
     val sc = new SparkContext(sparkConf)
+   
+    //Highest docID in the wikiarticles-collection
+     val c = 9893064
+     //fetch one doc at a time with cassandra
+    for (i <- 1 to c by 1) {
+   
+    println(i)
+    
+    val rdd =
+      sc.cassandraTable(cassandraKeyspace, cassandraWikiTables).select("docid", "wikitext").where("docid = ?", s"${i}")
+    val documents = rdd
+      .map(x => (x.get[Long]("docid"), InverseIndexBuilderImpl.buildIndexKeys(x.get[String]("wikitext"))))
+    val invIndexEntries = documents
+      .map(x => InverseIndexBuilderImpl.buildInverseIndexEntry(x._1, x._2))
+    val merge = invIndexEntries
+      .flatMap(identity).map(x => (x._1, x._2._1, x._2._2))
+    merge
+      .saveToCassandra(cassandraKeyspace, cassandraInvIndexTables, SomeColumns("word", "docid", "occurences"))
+     }
 
-    val rdd = sc.cassandraTable(cassandraKeyspace, cassandraWikiTables)
-    val documents = rdd.map(x => (x.get[Long]("docid"), InverseIndexBuilderImpl.buildIndexKeys(x.get[String]("wikitext"))))
-    val invIndexEntries = documents.map(x => InverseIndexBuilderImpl.buildInverseIndexEntry(x._1, x._2))
-    val merge = invIndexEntries.flatMap(identity).map(x => (x._1, x._2._1, x._2._2))
-
-    merge.saveToCassandra(cassandraKeyspace, cassandraInvIndexTables, SomeColumns("word", "docid", "occurences"))
     sc.stop()
     println("Import Complete")
   }
@@ -395,19 +432,27 @@ object SparkApp {
     prop.setProperty("user", mySQLDBUser)
     prop.setProperty("password", mySQLDBPW)
 
-    val df = sqlContext.read.jdbc(mySQLClient, mySQLWikiTable, prop)
+        //Highest docID in the wikiarticles-collection
+    val c = 9893064
 
-    val documents = df.select("docID", "wikitext").rdd
-      .map(x => (x.getLong(0), InverseIndexBuilderImpl.buildIndexKeys(x.getString(1))))
+    //just one document per loop recommenced has proven to be the fastest
+    for (i <- 1 to c by 1) {
 
-    val invIndexEntries = documents.map(x => InverseIndexBuilderImpl.buildInverseIndexEntry(x._1, x._2))
-    val merge = invIndexEntries.flatMap(identity)
-      .map(X => ((X._1, X._2._1), X._2._2))
-      .flatMapValues(identity)
-      .map(X => (X._1._1, X._1._2, X._2))
+      println(i)
 
-    val dfWithSchema = sqlContext.createDataFrame(merge).toDF("word", "docID", "occurence")
-    dfWithSchema.write.mode("append").jdbc(mySQLClient, mySQLIndexTable, prop)
+      val df = sqlContext.read.jdbc(mySQLClient, mySQLWikiTable, prop).select("dociD", "wikitext").where(s"docID = ${i}")
+      val documents = df.rdd
+        .map(x => (x.getLong(0), InverseIndexBuilderImpl.buildIndexKeys(x.getString(1))))
+
+      val invIndexEntries = documents.map(x => InverseIndexBuilderImpl.buildInverseIndexEntry(x._1, x._2))
+      val merge = invIndexEntries.flatMap(identity)
+        .map(X => ((X._1, X._2._1), X._2._2))
+        .flatMapValues(identity)
+        .map(X => (X._1._1, X._1._2, X._2))
+
+      val dfWithSchema = sqlContext.createDataFrame(merge).toDF("word", "docID", "occurence")
+      dfWithSchema.write.mode("append").jdbc(mySQLClient, mySQLIndexTable, prop)
+    }
     sc.stop()
     println("Import Complete")
   }
@@ -455,15 +500,24 @@ object SparkApp {
       .getOrCreate()
 
     val df = MongoSpark.load(sc)
+    //Highest docID in the wikiarticles-collection
+    val c = 9893064
+    //how many documents to fetch at once
+    val x = 500
+    
+    for (i <- x to c by x) {
+    println(x)
+      val documents = df.select("_id", "wikitext").filter(df("_id") < i).filter(df("_id") > (i - x))
+        .rdd
+        .map(x => (x.getLong(0), InverseIndexBuilderImpl.buildIndexKeys(x.getString(1))))
 
-    val documents = df.select("_id", "wikitext").rdd
-      .map(x => (x.getLong(0), InverseIndexBuilderImpl.buildIndexKeys(x.getString(1))))
+      val invIndexEntries = documents.map(x => InverseIndexBuilderImpl.buildInverseIndexEntry(x._1, x._2))
+      val merge = invIndexEntries.flatMap(identity).groupBy(_._1).map { case (k, v) => (k, v.map(_._2).toList) }
+      val dfWithSchema = sc.createDataFrame(merge.toJavaRDD()).toDF("_id", "invIndex")
 
-    val invIndexEntries = documents.map(x => InverseIndexBuilderImpl.buildInverseIndexEntry(x._1, x._2))
-    val merge = invIndexEntries.flatMap(identity).groupBy(_._1).map { case (k, v) => (k, v.map(_._2).toList) }
-    val dfWithSchema = sc.createDataFrame(merge.toJavaRDD()).toDF("_id", "invIndex")
+      MongoSpark.save(dfWithSchema.write.mode("append"))
+    }
 
-    MongoSpark.save(dfWithSchema.write.mode("append"))
     sc.stop()
     println("Import Complete")
   }
